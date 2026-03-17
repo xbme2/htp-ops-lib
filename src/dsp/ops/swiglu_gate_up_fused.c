@@ -10,10 +10,11 @@
 // -> SWIGLU fuse are executed sequentially on purpose.
 
 #include <assert.h>
-#include <stdbool.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "dsp/dma_utils.h"
 #include "dsp/hmx_mgr.h"
@@ -60,19 +61,19 @@ static inline int dma_issue_load_from_ddr_local(dma_desc_1d_t *desc, void *vtcm_
   return dma_submit_one(desc);
 }
 
-static void find_chunk_size_local(size_t x_max, size_t y_max, size_t xy_max, size_t x_unit, size_t y_unit, size_t *x_out,
-                                  size_t *y_out) {
+static void find_chunk_size_local(size_t x_max, size_t y_max, size_t xy_max, size_t x_unit, size_t y_unit,
+                                  size_t *x_out, size_t *y_out) {
   int64_t best_xy = 0;
-  size_t best_x = 0;
-  size_t best_y = 0;
+  size_t  best_x  = 0;
+  size_t  best_y  = 0;
 
   for (size_t x = x_max; x > 0; x -= x_unit) {
-    const size_t y = smin(align_down(xy_max / x, y_unit), y_max);
+    const size_t  y  = smin(align_down(xy_max / x, y_unit), y_max);
     const int64_t xy = x * y;
     if (best_xy < xy) {
       best_xy = xy;
-      best_x = x;
-      best_y = y;
+      best_x  = x;
+      best_y  = y;
     }
   }
 
@@ -80,8 +81,8 @@ static void find_chunk_size_local(size_t x_max, size_t y_max, size_t xy_max, siz
   *y_out = best_y;
 }
 
-static void transfer_activation_chunk_fp32_to_fp16_local(__fp16 *restrict vtcm_dst, const float *restrict src, int n_rows,
-                                                         int k_block, int k_stride) {
+static void transfer_activation_chunk_fp32_to_fp16_local(__fp16 *restrict vtcm_dst, const float *restrict src,
+                                                         int n_rows, int k_block, int k_stride) {
   assert(k_block % HMX_FP16_TILE_N_COLS == 0 && k_stride % HMX_FP16_TILE_N_COLS == 0);
   assert(VLEN == 32 * sizeof(float));
 
@@ -92,28 +93,28 @@ static void transfer_activation_chunk_fp32_to_fp16_local(__fp16 *restrict vtcm_d
       l2fetch(prefetch_addr, k_stride * sizeof(float), k_block * sizeof(float), 2, 0);
     }
 
-    const int r0 = r / HMX_FP16_TILE_N_ROWS;
-    const int r1 = r % HMX_FP16_TILE_N_ROWS;
+    const int  r0             = r / HMX_FP16_TILE_N_ROWS;
+    const int  r1             = r % HMX_FP16_TILE_N_ROWS;
     const bool next_row_valid = (r + 1) < n_rows;
 
     const HVX_Vector *pv_in0 = (const HVX_Vector *) (src + (r + 0) * k_stride);
     const HVX_Vector *pv_in1 = (const HVX_Vector *) (src + (r + 1) * k_stride);
 
     for (int c = 0; c < k_block; c += 32) {
-      const HVX_Vector v0 = *pv_in0++;
-      const HVX_Vector v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+      const HVX_Vector v0    = *pv_in0++;
+      const HVX_Vector v1    = next_row_valid ? *pv_in1++ : Q6_V_vzero();
       const HVX_Vector v_out = hvx_my_wsf_to_vhf(v1, v0);
 
-      const int c0 = c / HMX_FP16_TILE_N_COLS;
-      const int tile_idx = r0 * (k_block / HMX_FP16_TILE_N_COLS) + c0;
-      HVX_Vector *tile = (HVX_Vector *) (vtcm_dst + tile_idx * HMX_FP16_TILE_N_ELMS);
-      tile[r1 / 2] = v_out;
+      const int   c0       = c / HMX_FP16_TILE_N_COLS;
+      const int   tile_idx = r0 * (k_block / HMX_FP16_TILE_N_COLS) + c0;
+      HVX_Vector *tile     = (HVX_Vector *) (vtcm_dst + tile_idx * HMX_FP16_TILE_N_ELMS);
+      tile[r1 / 2]         = v_out;
     }
   }
 }
 
-static void core_dot_chunk_fp16_local(__fp16 *output, const __fp16 *activation, const __fp16 *weight, const __fp16 *scales,
-                                      int n_row_tiles, int n_col_tiles, int n_dot_tiles) {
+static void core_dot_chunk_fp16_local(__fp16 *output, const __fp16 *activation, const __fp16 *weight,
+                                      const __fp16 *scales, int n_row_tiles, int n_col_tiles, int n_dot_tiles) {
   hmx_unit_acquire();
 
   asm volatile("mxclracc.hf");
@@ -125,7 +126,7 @@ static void core_dot_chunk_fp16_local(__fp16 *output, const __fp16 *activation, 
       const __fp16 *col_tiles = weight + c * n_dot_tiles * HMX_FP16_TILE_N_ELMS;
 
       for (int k0 = 0; k0 < n_dot_tiles; k0 += 32) {
-        const int offset = k0 * HMX_FP16_TILE_N_ELMS;
+        const int    offset  = k0 * HMX_FP16_TILE_N_ELMS;
         const size_t n_tiles = smin(n_dot_tiles - k0, 32);
         hmx_load_tiles_fp16(row_tiles + offset, col_tiles + offset, n_tiles);
       }
@@ -164,7 +165,7 @@ static void build_silu_lut_local(float *lut, int lut_size, float clamp) {
   const float step = (2.0f * clamp) / (float) lut_size;
   for (int i = 0; i <= lut_size; ++i) {
     const float x = -clamp + step * (float) i;
-    lut[i] = silu_exact_scalar_local(x);
+    lut[i]        = silu_exact_scalar_local(x);
   }
 }
 
@@ -177,30 +178,35 @@ static inline float silu_lut_scalar_local(float x, const float *lut, int lut_siz
   }
 
   const float step = (2.0f * clamp) / (float) lut_size;
-  const float u = (x + clamp) / step;
-  int i = (int) u;
+  const float u    = (x + clamp) / step;
+  int         i    = (int) u;
   if (i < 0) {
     i = 0;
   } else if (i >= lut_size) {
     i = lut_size - 1;
   }
 
-  const float t = u - (float) i;
+  const float t  = u - (float) i;
   const float y0 = lut[i];
   const float y1 = lut[i + 1];
   return y0 + (y1 - y0) * t;
 }
 
-static void fuse_gate_up_chunk_fp16_to_fp32_local(float *restrict dst,
-                                                  const __fp16 *restrict gate_vtcm,
-                                                  const __fp16 *restrict up_vtcm,
-                                                  int n_rows,
-                                                  int n_cols,
-                                                  int dst_stride,
-                                                  const float *restrict silu_lut,
-                                                  int silu_lut_size,
-                                                  float silu_lut_clamp,
-                                                  bool use_silu_lut) {
+static void fuse_gate_up_fp32_local(float *restrict dst, const float *restrict gate, const float *restrict up,
+                                    size_t n_elems, const float *restrict silu_lut, int silu_lut_size,
+                                    float silu_lut_clamp, bool use_silu_lut) {
+  for (size_t i = 0; i < n_elems; ++i) {
+    const float gate_val = gate[i];
+    const float silu_val = use_silu_lut ? silu_lut_scalar_local(gate_val, silu_lut, silu_lut_size, silu_lut_clamp) :
+                                          silu_exact_scalar_local(gate_val);
+    dst[i]               = silu_val * up[i];
+  }
+}
+
+static void fuse_gate_up_chunk_fp16_to_fp32_local(float *restrict dst, const __fp16 *restrict gate_vtcm,
+                                                  const __fp16 *restrict up_vtcm, int n_rows, int n_cols,
+                                                  int dst_stride, const float *restrict silu_lut, int silu_lut_size,
+                                                  float silu_lut_clamp, bool use_silu_lut) {
   assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
 
   const int n_col_tiles = n_cols / HMX_FP16_TILE_N_COLS;
@@ -256,11 +262,11 @@ static void fuse_gate_up_chunk_fp16_to_fp32_local(float *restrict dst,
       }
 
       HVX_Vector *pv_out0 = (HVX_Vector *) (dst + r * dst_stride + c);
-      *pv_out0 = v_out0_sf;
+      *pv_out0            = v_out0_sf;
 
       if (r + 1 < n_rows) {
         HVX_Vector *pv_out1 = (HVX_Vector *) (dst + (r + 1) * dst_stride + c);
-        *pv_out1 = v_out1_sf;
+        *pv_out1            = v_out1_sf;
       }
     }
   }
@@ -268,18 +274,61 @@ static void fuse_gate_up_chunk_fp16_to_fp32_local(float *restrict dst,
 
 void dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, const void *src, int ne, int k,
                                                        enum ggml_type type, void *vtcm_scratch);
+int  hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activation,
+                                 const __fp16 *restrict permuted_weight, int m, int k, int n);
 
-int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst,
-                                             const float *restrict activation,
-                                             const uint8_t *restrict gate_weight,
-                                             const uint8_t *restrict up_weight,
-                                             int m,
-                                             int k,
-                                             int n,
-                                             enum ggml_type weight_type,
-                                             int silu_lut_bits,
-                                             float silu_lut_clamp,
-                                             bool use_silu_lut) {
+int hmx_hvx_swiglu_gate_up_fused_w16a32(float *restrict dst, const float *restrict activation,
+                                        const __fp16 *restrict gate_weight, const __fp16 *restrict up_weight, int m,
+                                        int k, int n, int silu_lut_bits, float silu_lut_clamp, bool use_silu_lut) {
+  if (!dst || !activation || !gate_weight || !up_weight || !m || !k || !n) {
+    return -1;
+  }
+  if (k % 32 != 0 || n % 32 != 0) {
+    return -1;
+  }
+  if (!is_aligned(dst, VLEN) || !is_aligned(activation, VLEN) || !is_aligned(gate_weight, VLEN) ||
+      !is_aligned(up_weight, VLEN)) {
+    return -1;
+  }
+  if (use_silu_lut && (silu_lut_bits <= 0 || silu_lut_bits > SILU_LUT_MAX_BITS || !(silu_lut_clamp > 0.0f))) {
+    return -1;
+  }
+
+  _Alignas(VLEN) float silu_lut[SILU_LUT_MAX_ENTRIES];
+  int                  silu_lut_size = 0;
+  if (use_silu_lut) {
+    silu_lut_size = 1 << silu_lut_bits;
+    build_silu_lut_local(silu_lut, silu_lut_size, silu_lut_clamp);
+  }
+
+  const size_t n_elems  = (size_t) m * (size_t) n;
+  float       *gate_tmp = NULL;
+  float       *up_tmp   = NULL;
+  if (posix_memalign((void **) &gate_tmp, VLEN, n_elems * sizeof(float)) != 0 ||
+      posix_memalign((void **) &up_tmp, VLEN, n_elems * sizeof(float)) != 0) {
+    free(gate_tmp);
+    free(up_tmp);
+    return -1;
+  }
+
+  int err = 0;
+  err     = hmx_mat_mul_permuted_w16a32(gate_tmp, activation, gate_weight, m, k, n);
+  if (err == 0) {
+    err = hmx_mat_mul_permuted_w16a32(up_tmp, activation, up_weight, m, k, n);
+  }
+  if (err == 0) {
+    fuse_gate_up_fp32_local(dst, gate_tmp, up_tmp, n_elems, silu_lut, silu_lut_size, silu_lut_clamp, use_silu_lut);
+  }
+
+  free(gate_tmp);
+  free(up_tmp);
+  return err;
+}
+
+int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst, const float *restrict activation,
+                                             const uint8_t *restrict gate_weight, const uint8_t *restrict up_weight,
+                                             int m, int k, int n, enum ggml_type weight_type, int silu_lut_bits,
+                                             float silu_lut_clamp, bool use_silu_lut) {
   if (!dst || !activation || !gate_weight || !up_weight || !m || !k || !n) {
     return -1;
   }
@@ -289,16 +338,16 @@ int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst,
   if (k % QK_K != 0 || n % 32 != 0) {
     return -1;
   }
-  if (!is_aligned(dst, VLEN) || !is_aligned(activation, VLEN) || !is_aligned(gate_weight, VLEN) || !is_aligned(up_weight, VLEN)) {
+  if (!is_aligned(dst, VLEN) || !is_aligned(activation, VLEN) || !is_aligned(gate_weight, VLEN) ||
+      !is_aligned(up_weight, VLEN)) {
     return -1;
   }
-  if (use_silu_lut &&
-      (silu_lut_bits <= 0 || silu_lut_bits > SILU_LUT_MAX_BITS || !(silu_lut_clamp > 0.0f))) {
+  if (use_silu_lut && (silu_lut_bits <= 0 || silu_lut_bits > SILU_LUT_MAX_BITS || !(silu_lut_clamp > 0.0f))) {
     return -1;
   }
 
   _Alignas(VLEN) float silu_lut[SILU_LUT_MAX_ENTRIES];
-  int silu_lut_size = 0;
+  int                  silu_lut_size = 0;
   if (use_silu_lut) {
     silu_lut_size = 1 << silu_lut_bits;
     build_silu_lut_local(silu_lut, silu_lut_size, silu_lut_clamp);
@@ -335,44 +384,36 @@ int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst,
   dma_desc_1d_t dma_desc __attribute__((aligned(64)));
 
   for (size_t mr = 0; mr < (size_t) m; mr += m_chunk_n_rows) {
-    const size_t n_rows = smin((size_t) m - mr, m_chunk_n_rows);
+    const size_t n_rows           = smin((size_t) m - mr, m_chunk_n_rows);
     const float *activation_chunk = activation + mr * k;
 
     transfer_activation_chunk_fp32_to_fp16_local(vtcm_activation, activation_chunk, (int) n_rows, k, k);
 
     for (size_t nc = 0; nc < (size_t) n; nc += n_chunk_n_cols) {
-      const size_t n_cols = smin((size_t) n - nc, n_chunk_n_cols);
+      const size_t n_cols   = smin((size_t) n - nc, n_chunk_n_cols);
       const size_t chunk_ne = n_cols * k;
       assert(chunk_ne % QK_K == 0);
       const size_t qweight_chunk_size = chunk_ne / QK_K * super_block_size;
-      const size_t weight_offset = (nc * k / QK_K) * super_block_size;
+      const size_t weight_offset      = (nc * k / QK_K) * super_block_size;
 
       dma_issue_load_from_ddr_local(&dma_desc, vtcm_qweight, gate_weight + weight_offset, qweight_chunk_size);
       dma_wait_for_idle();
-      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight, NULL, (int) chunk_ne, k, weight_type, vtcm_qweight);
+      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight, NULL, (int) chunk_ne, k, weight_type,
+                                                        vtcm_qweight);
       core_dot_chunk_fp16_local(vtcm_gate_out, vtcm_activation, vtcm_weight, vtcm_scales,
                                 (int) ceil_div(n_rows, HMX_FP16_TILE_N_ROWS),
-                                (int) ceil_div(n_cols, HMX_FP16_TILE_N_COLS),
-                                k / HMX_FP16_TILE_N_COLS);
+                                (int) ceil_div(n_cols, HMX_FP16_TILE_N_COLS), k / HMX_FP16_TILE_N_COLS);
 
       dma_issue_load_from_ddr_local(&dma_desc, vtcm_qweight, up_weight + weight_offset, qweight_chunk_size);
       dma_wait_for_idle();
-      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight, NULL, (int) chunk_ne, k, weight_type, vtcm_qweight);
+      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight, NULL, (int) chunk_ne, k, weight_type,
+                                                        vtcm_qweight);
       core_dot_chunk_fp16_local(vtcm_up_out, vtcm_activation, vtcm_weight, vtcm_scales,
                                 (int) ceil_div(n_rows, HMX_FP16_TILE_N_ROWS),
-                                (int) ceil_div(n_cols, HMX_FP16_TILE_N_COLS),
-                                k / HMX_FP16_TILE_N_COLS);
+                                (int) ceil_div(n_cols, HMX_FP16_TILE_N_COLS), k / HMX_FP16_TILE_N_COLS);
 
-      fuse_gate_up_chunk_fp16_to_fp32_local(dst + mr * n + nc,
-                                            vtcm_gate_out,
-                                            vtcm_up_out,
-                                            (int) n_rows,
-                                            (int) n_cols,
-                                            n,
-                                            silu_lut,
-                                            silu_lut_size,
-                                            silu_lut_clamp,
-                                            use_silu_lut);
+      fuse_gate_up_chunk_fp16_to_fp32_local(dst + mr * n + nc, vtcm_gate_out, vtcm_up_out, (int) n_rows, (int) n_cols,
+                                            n, silu_lut, silu_lut_size, silu_lut_clamp, use_silu_lut);
     }
   }
 

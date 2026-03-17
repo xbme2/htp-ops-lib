@@ -384,6 +384,76 @@ bail:
   return err;
 }
 
+// FastRPC interface
+AEEResult htp_ops_swiglu_gate_up_fused_w16a32(remote_handle64 handle, int32 output_fd, int32 output_offset,
+                                              int32 activation_fd, int32 activation_offset, int32 gate_weight_fd,
+                                              int32 gate_weight_offset, int32 up_weight_fd, int32 up_weight_offset,
+                                              int32 m, int32 k, int32 n, int32 use_silu_lut, int32 silu_lut_bits,
+                                              float silu_lut_clamp) {
+  uint8_t *p0, *p1, *p2, *p3;
+  p0 = p1 = p2 = p3 = NULL;
+
+  int err = HAP_mmap_get(output_fd, (void **) &p0, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  err = HAP_mmap_get(activation_fd, (void **) &p1, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  err = HAP_mmap_get(gate_weight_fd, (void **) &p2, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  err = HAP_mmap_get(up_weight_fd, (void **) &p3, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  float        *output      = (float *) (p0 + output_offset);
+  const float  *activation  = (const float *) (p1 + activation_offset);
+  const __fp16 *gate_weight = (const __fp16 *) (p2 + gate_weight_offset);
+  const __fp16 *up_weight   = (const __fp16 *) (p3 + up_weight_offset);
+
+  size_t output_size      = (size_t) m * (size_t) n * sizeof(float);
+  size_t activation_size  = (size_t) m * (size_t) k * sizeof(float);
+  size_t gate_weight_size = (size_t) k * (size_t) n * sizeof(__fp16);
+  size_t up_weight_size   = (size_t) k * (size_t) n * sizeof(__fp16);
+
+  qurt_mem_cache_clean((qurt_addr_t) activation, activation_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+  qurt_mem_cache_clean((qurt_addr_t) gate_weight, gate_weight_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+  qurt_mem_cache_clean((qurt_addr_t) up_weight, up_weight_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+
+  hmx_manager_enable_execution();
+  err = hmx_hvx_swiglu_gate_up_fused_w16a32(output, activation, gate_weight, up_weight, m, k, n, silu_lut_bits,
+                                            silu_lut_clamp, use_silu_lut != 0);
+  hmx_manager_disable_execution();
+
+  qurt_mem_cache_clean((qurt_addr_t) output, output_size, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+
+bail:
+  if (p0) {
+    HAP_mmap_put(output_fd);
+  }
+  if (p1) {
+    HAP_mmap_put(activation_fd);
+  }
+  if (p2) {
+    HAP_mmap_put(gate_weight_fd);
+  }
+  if (p3) {
+    HAP_mmap_put(up_weight_fd);
+  }
+  return err;
+}
+
 void internal_op_tests();
 
 // FastRPC interface

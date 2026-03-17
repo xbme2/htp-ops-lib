@@ -17,19 +17,15 @@ int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, in
 
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *activation, const __fp16 *permuted_weight, int m,
                                 int k, int n);
+int hmx_hvx_swiglu_gate_up_fused_w16a32(float *restrict dst, const float *restrict activation,
+                                        const __fp16 *restrict gate_weight, const __fp16 *restrict up_weight, int m,
+                                        int k, int n, int silu_lut_bits, float silu_lut_clamp, bool use_silu_lut);
 int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *activation, const uint8_t *permuted_weight,
                                      int m, int k, int n, enum ggml_type weight_type);
-int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst,
-                                             const float *restrict activation,
-                                             const uint8_t *restrict gate_weight,
-                                             const uint8_t *restrict up_weight,
-                                             int m,
-                                             int k,
-                                             int n,
-                                             enum ggml_type weight_type,
-                                             int silu_lut_bits,
-                                             float silu_lut_clamp,
-                                             bool use_silu_lut);
+int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst, const float *restrict activation,
+                                             const uint8_t *restrict gate_weight, const uint8_t *restrict up_weight,
+                                             int m, int k, int n, enum ggml_type weight_type, int silu_lut_bits,
+                                             float silu_lut_clamp, bool use_silu_lut);
 
 int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                       const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim);

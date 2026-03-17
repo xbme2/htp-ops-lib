@@ -339,6 +339,141 @@ static void test_mat_mul_rpc(remote_handle64 handle) {
   free_shared_mem_buf(weight, weight_fd, k * n * sizeof(__fp16));
 }
 
+static inline float silu_exact_ref(float x) {
+  return x / (1.0f + expf(-x));
+}
+
+static void test_swiglu_gate_up_fused_w16a32_rpc(remote_handle64 handle) {
+  float  *activation = NULL, *output = NULL;
+  __fp16 *gate_weight = NULL, *up_weight = NULL;
+
+  int output_fd, activation_fd, gate_weight_fd, up_weight_fd;
+  output_fd = activation_fd = gate_weight_fd = up_weight_fd = -1;
+  int err = 0;
+  float *gate_weight_ref = NULL;
+  float *up_weight_ref   = NULL;
+  float *gate_out_ref    = NULL;
+  float *up_out_ref      = NULL;
+  float *output_ref      = NULL;
+
+  const int m = 1;
+  const int k = 1024;
+  const int n = 1024;
+
+  if (alloc_shared_mem_buf((void **) &output, &output_fd, m * n * sizeof(float)) ||
+      alloc_shared_mem_buf((void **) &activation, &activation_fd, m * k * sizeof(float)) ||
+      alloc_shared_mem_buf((void **) &gate_weight, &gate_weight_fd, k * n * sizeof(__fp16)) ||
+      alloc_shared_mem_buf((void **) &up_weight, &up_weight_fd, k * n * sizeof(__fp16))) {
+    fprintf(stderr, "%s: rpcmem allocation failed\n", __func__);
+    goto end;
+  }
+
+  gate_weight_ref = (float *) malloc((size_t) k * (size_t) n * sizeof(float));
+  up_weight_ref   = (float *) malloc((size_t) k * (size_t) n * sizeof(float));
+  gate_out_ref    = (float *) malloc((size_t) m * (size_t) n * sizeof(float));
+  up_out_ref      = (float *) malloc((size_t) m * (size_t) n * sizeof(float));
+  output_ref      = (float *) malloc((size_t) m * (size_t) n * sizeof(float));
+  if (!gate_weight_ref || !up_weight_ref || !gate_out_ref || !up_out_ref || !output_ref) {
+    fprintf(stderr, "%s: host allocation failed\n", __func__);
+    goto end;
+  }
+  memset(gate_out_ref, 0, (size_t) m * (size_t) n * sizeof(float));
+  memset(up_out_ref, 0, (size_t) m * (size_t) n * sizeof(float));
+  memset(output_ref, 0, (size_t) m * (size_t) n * sizeof(float));
+
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < k; ++j) {
+      activation[i * k + j] = rand_01() * 2.0f - 1.0f;
+    }
+  }
+
+  for (int i = 0; i < k; ++i) {
+    for (int j = 0; j < n; ++j) {
+      const float x_gate = rand_01() * 2.0f - 1.0f;
+      const float x_up   = rand_01() * 2.0f - 1.0f;
+
+      const int i0 = i / 32, i1 = i % 32;
+      const int j0 = j / 32, j1 = j % 32;
+
+      const int tile_idx = j0 * (k / 32) + i0;
+      __fp16 *gate_tile = gate_weight + tile_idx * 1024;
+      __fp16 *up_tile   = up_weight + tile_idx * 1024;
+
+      gate_tile[(i1 & ~1) * 32 + j1 * 2 + (i1 & 1)] = (__fp16) x_gate;
+      up_tile[(i1 & ~1) * 32 + j1 * 2 + (i1 & 1)]   = (__fp16) x_up;
+
+      gate_weight_ref[i * n + j] = x_gate;
+      up_weight_ref[i * n + j]   = x_up;
+    }
+  }
+
+  int64_t t0 = get_time_us();
+  err = htp_ops_swiglu_gate_up_fused_w16a32(handle,
+                                            output_fd, 0,
+                                            activation_fd, 0,
+                                            gate_weight_fd, 0,
+                                            up_weight_fd, 0,
+                                            m, k, n,
+                                            0, 0, 0.0f);
+  int64_t rpc_elapsed_us = get_time_us() - t0;
+  fprintf(stderr, "swiglu_gate_up_fused_w16a32 RPC took %ld us\n", rpc_elapsed_us);
+
+  if (err != 0) {
+    fprintf(stderr, "%s: RPC failed with %x\n", __func__, err);
+    goto end;
+  }
+
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) {
+      for (int l = 0; l < k; ++l) {
+        gate_out_ref[i * n + j] +=
+            (float) (((__fp16) activation[i * k + l]) * ((__fp16) gate_weight_ref[l * n + j]));
+        up_out_ref[i * n + j] +=
+            (float) (((__fp16) activation[i * k + l]) * ((__fp16) up_weight_ref[l * n + j]));
+      }
+      output_ref[i * n + j] = silu_exact_ref(gate_out_ref[i * n + j]) * up_out_ref[i * n + j];
+    }
+  }
+
+  int   n_failed = 0;
+  float max_err  = 0.0f;
+  float tol      = 2e-2f;
+  for (int i = 0; i < m * n; ++i) {
+    const float err_val = fabs(output_ref[i] - output[i]);
+    if (err_val > max_err) {
+      max_err = err_val;
+    }
+    if (err_val > tol) {
+      ++n_failed;
+      if (n_failed < 16) {
+        fprintf(stderr, "%s: idx %d, ref=%g, dsp=%g, err=%g\n", __func__, i, output_ref[i], output[i], err_val);
+      }
+    }
+  }
+
+  fprintf(stderr, "%s: max_err=%g, n_failed=%d, tol=%g\n", __func__, max_err, n_failed, tol);
+
+end:
+  free(gate_weight_ref);
+  free(up_weight_ref);
+  free(gate_out_ref);
+  free(up_out_ref);
+  free(output_ref);
+
+  if (output) {
+    free_shared_mem_buf(output, output_fd, m * n * sizeof(float));
+  }
+  if (activation) {
+    free_shared_mem_buf(activation, activation_fd, m * k * sizeof(float));
+  }
+  if (gate_weight) {
+    free_shared_mem_buf(gate_weight, gate_weight_fd, k * n * sizeof(__fp16));
+  }
+  if (up_weight) {
+    free_shared_mem_buf(up_weight, up_weight_fd, k * n * sizeof(__fp16));
+  }
+}
+
 int main(int argc, char **argv) {
   int err = open_dsp_session(CDSP_DOMAIN_ID, 1);
   if (err != 0) {
@@ -349,6 +484,7 @@ int main(int argc, char **argv) {
   init_htp_backend();
 
   // test_mat_mul_rpc(get_global_handle());
+  // test_swiglu_gate_up_fused_w16a32_rpc(get_global_handle());
 
   htp_ops_test_ops(get_global_handle());
 

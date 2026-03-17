@@ -15,6 +15,12 @@ interface htp_ops : remote_handle64 {
     AEEResult rms_norm_f32(in int32 fd0, in int32 offset0, in int32 fd1, in int32 offset1, in int32 ne0, in int32 ne1);
     AEEResult mat_mul_permuted_w16a32(in int32 fd0, in int32 offset0, in int32 fd1, in int32 offset1, in int32 fd2, in int32 offset2,
         in int32 m, in int32 k, in int32 n);
+    AEEResult swiglu_gate_up_fused_w16a32(in int32 fd0, in int32 offset0,
+        in int32 fd1, in int32 offset1,
+        in int32 fd2, in int32 offset2,
+        in int32 fd3, in int32 offset3,
+        in int32 m, in int32 k, in int32 n,
+        in int32 use_silu_lut, in int32 silu_lut_bits, in float silu_lut_clamp);
     
     AEEResult test_ops();
 };
