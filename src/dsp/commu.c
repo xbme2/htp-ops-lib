@@ -95,8 +95,17 @@ static void msg_receiver_loop(void *param) {
           {
             // TODO(hzx): use separate thread (pool) to execute op
             struct OpComputeRequest *compute_req = (struct OpComputeRequest *) req_hdr->data;
+            if (compute_req->op == HTP_OPS_SWIGLU_GATE_UP_FUSED_W16A32 ||
+                compute_req->op == HTP_OPS_SWIGLU_GATE_UP_FUSED_W4D16A32_IQ4_NL) {
+              FARF(ALWAYS, "msg_receiver: REQUEST_TYPE_OP_COMPUTE op=%u", compute_req->op);
+            }
 
             req_hdr->state = execute_op_simple(compute_req);
+            if (compute_req->op == HTP_OPS_SWIGLU_GATE_UP_FUSED_W16A32 ||
+                compute_req->op == HTP_OPS_SWIGLU_GATE_UP_FUSED_W4D16A32_IQ4_NL ||
+                req_hdr->state != 0) {
+              FARF(ALWAYS, "msg_receiver: op=%u ret=%d", compute_req->op, req_hdr->state);
+            }
           }
           break;
         case REQUEST_TYPE_RPCMEM_MAP:
@@ -109,6 +118,8 @@ static void msg_receiver_loop(void *param) {
           }
           break;
         default:
+          FARF(ALWAYS, "msg_receiver: unsupported request type %d", req_hdr->type);
+          req_hdr->state = AEE_EUNSUPPORTED;
           break;
       }
     }
@@ -386,10 +397,11 @@ bail:
 
 // FastRPC interface
 AEEResult htp_ops_swiglu_gate_up_fused_w16a32(remote_handle64 handle, int32 output_fd, int32 output_offset,
-                                              int32 activation_fd, int32 activation_offset, int32 gate_weight_fd,
-                                              int32 gate_weight_offset, int32 up_weight_fd, int32 up_weight_offset,
-                                              int32 m, int32 k, int32 n, int32 use_silu_lut, int32 silu_lut_bits,
-                                              float silu_lut_clamp) {
+                                              int32 activation_fd, int32 activation_offset,
+                                              int32 gate_weight_fd, int32 gate_weight_offset,
+                                              int32 up_weight_fd, int32 up_weight_offset,
+                                              int32 m, int32 k, int32 n,
+                                              int32 use_silu_lut, int32 silu_lut_bits, float silu_lut_clamp) {
   uint8_t *p0, *p1, *p2, *p3;
   p0 = p1 = p2 = p3 = NULL;
 
@@ -432,8 +444,16 @@ AEEResult htp_ops_swiglu_gate_up_fused_w16a32(remote_handle64 handle, int32 outp
   qurt_mem_cache_clean((qurt_addr_t) up_weight, up_weight_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
 
   hmx_manager_enable_execution();
-  err = hmx_hvx_swiglu_gate_up_fused_w16a32(output, activation, gate_weight, up_weight, m, k, n, silu_lut_bits,
-                                            silu_lut_clamp, use_silu_lut != 0);
+  err = hmx_hvx_swiglu_gate_up_fused_w16a32(output,
+                                            activation,
+                                            gate_weight,
+                                            up_weight,
+                                            m,
+                                            k,
+                                            n,
+                                            silu_lut_bits,
+                                            silu_lut_clamp,
+                                            use_silu_lut != 0);
   hmx_manager_disable_execution();
 
   qurt_mem_cache_clean((qurt_addr_t) output, output_size, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
