@@ -135,6 +135,28 @@ int execute_op_simple(struct OpComputeRequest *req) {
       }
       break;
 
+    case HTP_OPS_SWIGLU_GATE_UP_FUSED_W16A32:
+      {
+        auto params = reinterpret_cast<SwiGLUGateUpFusedParams *>(req->payload);
+        int  m = params->m, k = params->k, n = params->n;
+
+        size_t output_size     = m * n * sizeof(float);
+        size_t activation_size = m * k * sizeof(float);
+        size_t weight_size     = k * n * sizeof(__fp16);
+
+        add_buffer(out_bufs, params->output, output_size);
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->gate_weight, weight_size);
+        add_buffer(in_bufs, params->up_weight, weight_size);
+
+        validate_in_bufs();
+        ret = hmx_hvx_swiglu_gate_up_fused_w16a32(
+          (float *) OUT_PTR(0), (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1), (const __fp16 *) IN_PTR(2), m, k,
+          n, params->silu_lut_bits, params->silu_lut_clamp, params->use_silu_lut != 0);
+        validate_out_bufs();
+      }
+      break;
+
     case HTP_OPS_SWIGLU_GATE_UP_FUSED_W4D16A32_IQ4_NL:
       {
         auto params = reinterpret_cast<SwiGLUGateUpFusedParams *>(req->payload);
@@ -151,17 +173,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
         add_buffer(in_bufs, params->up_weight, weight_size, false);
 
         validate_in_bufs();
-        ret = hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32((float *) OUT_PTR(0),
-                                                       (const float *) IN_PTR(0),
-                                                       (const uint8_t *) IN_PTR(1),
-                                                       (const uint8_t *) IN_PTR(2),
-                                                       m,
-                                                       k,
-                                                       n,
-                                                       GGML_TYPE_IQ4_NL,
-                                                       params->silu_lut_bits,
-                                                       params->silu_lut_clamp,
-                                                       params->use_silu_lut != 0);
+        ret = hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(
+          (float *) OUT_PTR(0), (const float *) IN_PTR(0), (const uint8_t *) IN_PTR(1), (const uint8_t *) IN_PTR(2), m,
+          k, n, GGML_TYPE_IQ4_NL, params->silu_lut_bits, params->silu_lut_clamp, params->use_silu_lut != 0);
         validate_out_bufs();
       }
       break;
@@ -216,6 +230,8 @@ int execute_op_simple(struct OpComputeRequest *req) {
       break;
 
     default:
+      FARF(ALWAYS, "execute_op_simple: unsupported op index %u", req->op);
+      ret = -1;
       break;
   }
   return ret;
