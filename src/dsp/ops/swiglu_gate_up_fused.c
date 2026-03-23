@@ -37,11 +37,62 @@
 // Active stage selection:
 //   0 -> correctness-first baseline
 //   1 -> branch-interleaved qweight prefetch
-//   2 -> dual fp16 weight buffers + async HMX overlap
-//   3 -> stage2 + double output buffers to overlap fuse/store with current HMX
+//   2 -> smaller-VTCM dual-weight-buffer pipeline
+//   3 -> smaller-VTCM stage2 + double-output-buffer fuse/store overlap
+//   4 -> high-m pipeline-tuned chunking on top of stage3
+//   5 -> two-pass true pipeline (gate pass with SiLU store, then up pass with in-place mul)
+//   6 -> single-function joint pipeline (interleaved gate/up 4-stage schedule)
 #ifndef SWIGLU_GATE_UP_ACTIVE_STAGE
 #define SWIGLU_GATE_UP_ACTIVE_STAGE 1
 #endif
+
+#define FUSED_STAGE_PIPE_WEIGHT_AREA_SIZE  (768 * 1024)
+#define FUSED_STAGE_PIPE_OUTPUT_AREA_SIZE  (768 * 1024)
+#define FUSED_STAGE_PIPE_QWEIGHT_AREA_SIZE (768 * 1024)
+
+static inline size_t get_weight_area_size_local(void) {
+#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 2
+  return FUSED_STAGE_PIPE_WEIGHT_AREA_SIZE;
+#else
+  return FUSED_WEIGHT_AREA_SIZE;
+#endif
+}
+
+static inline size_t get_activation_area_size_local(void) {
+  return FUSED_ACTIVATION_AREA_SIZE;
+}
+
+static inline size_t get_output_area_size_local(void) {
+#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 2
+  return FUSED_STAGE_PIPE_OUTPUT_AREA_SIZE;
+#else
+  return FUSED_OUTPUT_AREA_SIZE;
+#endif
+}
+
+static inline size_t get_qweight_area_size_local(void) {
+#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 2
+  return FUSED_STAGE_PIPE_QWEIGHT_AREA_SIZE;
+#else
+  return FUSED_QWEIGHT_AREA_SIZE;
+#endif
+}
+
+static inline bool stage_uses_weight_aux_local(void) {
+#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 2
+  return true;
+#else
+  return false;
+#endif
+}
+
+static inline bool stage_uses_output_aux_local(void) {
+#if SWIGLU_GATE_UP_ACTIVE_STAGE == 3 || SWIGLU_GATE_UP_ACTIVE_STAGE == 4 || SWIGLU_GATE_UP_ACTIVE_STAGE == 5
+  return true;
+#else
+  return false;
+#endif
+}
 
 static inline size_t get_super_block_size_local(enum ggml_type weight_type) {
   switch (weight_type) {
@@ -89,6 +140,52 @@ static void find_chunk_size_local(size_t x_max, size_t y_max, size_t xy_max, siz
 
   *x_out = best_x;
   *y_out = best_y;
+}
+
+static inline size_t align_up_local(size_t x, size_t a) {
+  return ((x + a - 1) / a) * a;
+}
+
+static void choose_chunk_shape_high_m_pipeline_local(int m,
+                                                     int k,
+                                                     int n,
+                                                     size_t weight_area_size,
+                                                     size_t activation_area_size,
+                                                     size_t output_area_size,
+                                                     size_t qweight_area_size,
+                                                     size_t super_block_size,
+                                                     size_t *m_chunk_n_rows,
+                                                     size_t *n_chunk_n_cols) {
+  const size_t vec_dot_size = (size_t) k * sizeof(__fp16);
+  const size_t m_chunk_max_n_rows = align_down(activation_area_size / vec_dot_size, HMX_FP16_TILE_N_ROWS);
+  const size_t n_chunk_max_n_cols_by_weight = align_down(weight_area_size / vec_dot_size, HMX_FP16_TILE_N_COLS);
+  const size_t qweight_bytes_per_col = ((size_t) k / QK_K) * super_block_size;
+  const size_t n_chunk_max_n_cols_by_qweight = qweight_bytes_per_col == 0
+                                                   ? 0
+                                                   : align_down(qweight_area_size / qweight_bytes_per_col,
+                                                                HMX_FP16_TILE_N_COLS);
+  const size_t n_chunk_max_n_cols = smin(n_chunk_max_n_cols_by_weight, n_chunk_max_n_cols_by_qweight);
+
+  size_t preferred_rows = align_up_local((size_t) m, HMX_FP16_TILE_N_ROWS);
+  preferred_rows = smin(preferred_rows, m_chunk_max_n_rows);
+
+  if (m >= 128) {
+    preferred_rows = smax(preferred_rows, (size_t) 128);
+  } else if (m >= 64) {
+    preferred_rows = smax(preferred_rows, (size_t) 64);
+  }
+  preferred_rows = smin(preferred_rows, m_chunk_max_n_rows);
+
+  const size_t n_cols_cap_by_output = align_down((output_area_size / sizeof(__fp16)) / preferred_rows,
+                                                 HMX_FP16_TILE_N_COLS);
+  size_t preferred_cols = smin(n_chunk_max_n_cols, n_cols_cap_by_output);
+  preferred_cols = smin(preferred_cols, align_up_local((size_t) smax(n, HMX_FP16_TILE_N_COLS), HMX_FP16_TILE_N_COLS));
+  if (preferred_cols == 0) {
+    preferred_cols = HMX_FP16_TILE_N_COLS;
+  }
+
+  *m_chunk_n_rows = preferred_rows;
+  *n_chunk_n_cols = preferred_cols;
 }
 
 static void transfer_activation_chunk_fp32_to_fp16_local(__fp16 *restrict vtcm_dst, const float *restrict src, int n_rows,
@@ -289,6 +386,98 @@ static void fuse_gate_up_chunk_fp16_to_fp32_local(float *restrict dst,
       if (r + 1 < n_rows) {
         HVX_Vector *pv_out1 = (HVX_Vector *) (dst + (r + 1) * dst_stride + c);
         *pv_out1 = v_out1_sf;
+      }
+    }
+  }
+}
+
+static void silu_gate_chunk_fp16_to_fp32_local(float *restrict dst,
+                                               const __fp16 *restrict gate_vtcm,
+                                               int n_rows,
+                                               int n_cols,
+                                               int dst_stride,
+                                               const float *restrict silu_lut,
+                                               int silu_lut_size,
+                                               float silu_lut_clamp,
+                                               bool use_silu_lut) {
+  assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
+
+  const int n_col_tiles = n_cols / HMX_FP16_TILE_N_COLS;
+
+  _Alignas(VLEN) float gate_row0[32];
+  _Alignas(VLEN) float gate_row1[32];
+  _Alignas(VLEN) float out_row0[32];
+  _Alignas(VLEN) float out_row1[32];
+
+  for (int r = 0; r < n_rows; r += 2) {
+    const int r0 = r / HMX_FP16_TILE_N_ROWS;
+    const int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+    for (int c = 0; c < n_cols; c += HMX_FP16_TILE_N_COLS) {
+      const int c0 = c / HMX_FP16_TILE_N_COLS;
+      const __fp16 *gate_tile = gate_vtcm + (r0 * n_col_tiles + c0) * HMX_FP16_TILE_N_ELMS;
+      const HVX_Vector v_gate_hf = ((const HVX_Vector *) gate_tile)[r1 / 2];
+      const HVX_VectorPair vp_gate = hvx_my_vhf_to_wsf(v_gate_hf);
+
+      HVX_Vector v_out0_sf;
+      HVX_Vector v_out1_sf;
+
+      if (!use_silu_lut) {
+        v_out0_sf = hvx_silu_vec_f32_local(Q6_V_lo_W(vp_gate));
+        v_out1_sf = hvx_silu_vec_f32_local(Q6_V_hi_W(vp_gate));
+      } else {
+        vmem(gate_row0) = Q6_V_lo_W(vp_gate);
+        vmem(gate_row1) = Q6_V_hi_W(vp_gate);
+
+        for (int i = 0; i < 32; ++i) {
+          out_row0[i] = silu_lut_scalar_local(gate_row0[i], silu_lut, silu_lut_size, silu_lut_clamp);
+          out_row1[i] = silu_lut_scalar_local(gate_row1[i], silu_lut, silu_lut_size, silu_lut_clamp);
+        }
+
+        v_out0_sf = vmem(out_row0);
+        v_out1_sf = vmem(out_row1);
+      }
+
+      HVX_Vector *pv_out0 = (HVX_Vector *) (dst + r * dst_stride + c);
+      *pv_out0 = v_out0_sf;
+
+      if (r + 1 < n_rows) {
+        HVX_Vector *pv_out1 = (HVX_Vector *) (dst + (r + 1) * dst_stride + c);
+        *pv_out1 = v_out1_sf;
+      }
+    }
+  }
+}
+
+static void mul_dst_fp32_by_up_chunk_local(float *restrict dst,
+                                           const __fp16 *restrict up_vtcm,
+                                           int n_rows,
+                                           int n_cols,
+                                           int dst_stride) {
+  assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
+
+  const int n_col_tiles = n_cols / HMX_FP16_TILE_N_COLS;
+
+  for (int r = 0; r < n_rows; r += 2) {
+    const int r0 = r / HMX_FP16_TILE_N_ROWS;
+    const int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+    for (int c = 0; c < n_cols; c += HMX_FP16_TILE_N_COLS) {
+      const int c0 = c / HMX_FP16_TILE_N_COLS;
+      const __fp16 *up_tile = up_vtcm + (r0 * n_col_tiles + c0) * HMX_FP16_TILE_N_ELMS;
+      const HVX_Vector v_up_hf = ((const HVX_Vector *) up_tile)[r1 / 2];
+      const HVX_VectorPair vp_up = hvx_my_vhf_to_wsf(v_up_hf);
+
+      HVX_Vector *pv_dst0 = (HVX_Vector *) (dst + r * dst_stride + c);
+      const HVX_Vector v_dst0_sf = *pv_dst0;
+      const HVX_Vector v_mul0_qf32 = Q6_Vqf32_vmpy_VsfVsf(v_dst0_sf, Q6_V_lo_W(vp_up));
+      *pv_dst0 = Q6_Vsf_equals_Vqf32(v_mul0_qf32);
+
+      if (r + 1 < n_rows) {
+        HVX_Vector *pv_dst1 = (HVX_Vector *) (dst + (r + 1) * dst_stride + c);
+        const HVX_Vector v_dst1_sf = *pv_dst1;
+        const HVX_Vector v_mul1_qf32 = Q6_Vqf32_vmpy_VsfVsf(v_dst1_sf, Q6_V_hi_W(vp_up));
+        *pv_dst1 = Q6_Vsf_equals_Vqf32(v_mul1_qf32);
       }
     }
   }
@@ -686,6 +875,454 @@ static int swiglu_gate_up_qk_stage3_local(const swiglu_gate_up_qk_stage_ctx_loca
   return 0;
 }
 
+static int swiglu_gate_up_qk_stage4_local(const swiglu_gate_up_qk_stage_ctx_local_t *ctx) {
+  swiglu_gate_up_qk_stage_ctx_local_t tuned = *ctx;
+
+  choose_chunk_shape_high_m_pipeline_local(ctx->m,
+                                           ctx->k,
+                                           ctx->n,
+                                           get_weight_area_size_local(),
+                                           get_activation_area_size_local(),
+                                           get_output_area_size_local(),
+                                           get_qweight_area_size_local(),
+                                           ctx->super_block_size,
+                                           &tuned.m_chunk_n_rows,
+                                           &tuned.n_chunk_n_cols);
+
+  return swiglu_gate_up_qk_stage3_local(&tuned);
+}
+
+static int swiglu_gate_up_qk_pipeline_gate_pass_local(const swiglu_gate_up_qk_stage_ctx_local_t *ctx) {
+  static dma_desc_1d_t dma_desc __attribute__((aligned(64)));
+  static swiglu_gate_up_core_dot_task_state_local_t hmx_task_state;
+  static worker_pool_job_t hmx_task_job;
+
+  const int n_chunk_cnt = (int) ceil_div((size_t) ctx->n, ctx->n_chunk_n_cols);
+  const int n_rows = ctx->m;
+  __fp16 *vtcm_weight_bufs[2] = { ctx->vtcm_weight, ctx->vtcm_weight_aux };
+  __fp16 *vtcm_output_bufs[2] = { ctx->vtcm_gate_out, ctx->vtcm_gate_out_aux };
+
+  if (!ctx->vtcm_weight_aux || !ctx->vtcm_gate_out_aux || n_chunk_cnt <= 0) {
+    return -1;
+  }
+
+  // Gate pass as a 4-stage pipeline, modeled after mat_mul.c:
+  //   A: DMA load gate qweight chunk
+  //   B: dequantize qweight chunk into fp16 weight tiles
+  //   C: HMX matmul -> fp16 gate tiles
+  //   D: SiLU(gate) -> fp32 dst
+  //
+  // Buffering scheme:
+  //   A --> B: vtcm_qweight, 1 buffer
+  //   B --> C: vtcm_weight / vtcm_weight_aux, 2 buffers
+  //   C --> D: vtcm_gate_out / vtcm_gate_out_aux, 2 buffers
+
+  // prologue: A0
+  const size_t n_cols_a0 = smin((size_t) ctx->n, ctx->n_chunk_n_cols);
+  const size_t chunk_ne_a0 = n_cols_a0 * ctx->k;
+  const size_t chunk_size_a0 = chunk_ne_a0 / QK_K * ctx->super_block_size;
+  dma_issue_load_from_ddr_local(&dma_desc, ctx->vtcm_qweight, ctx->gate_weight, chunk_size_a0);
+
+  // prologue: B0, A1, C0, B1
+  dma_wait_for_idle();
+  dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight_bufs[0], NULL, (int) chunk_ne_a0, ctx->k,
+                                                    ctx->weight_type, ctx->vtcm_qweight);
+
+  if (1 < n_chunk_cnt) {
+    const size_t n_cols_a1 = smin((size_t) ctx->n - ctx->n_chunk_n_cols, ctx->n_chunk_n_cols);
+    const size_t chunk_ne_a1 = n_cols_a1 * ctx->k;
+    const size_t chunk_size_a1 = chunk_ne_a1 / QK_K * ctx->super_block_size;
+    const uint8_t *qweight_chunk_a1 = ctx->gate_weight + (ctx->n_chunk_n_cols * ctx->k / QK_K) * ctx->super_block_size;
+    dma_issue_load_from_ddr_local(&dma_desc, ctx->vtcm_qweight, qweight_chunk_a1, chunk_size_a1);
+  }
+
+  submit_core_dot_chunk_fp16_async_local(&hmx_task_state, &hmx_task_job,
+                                         vtcm_output_bufs[0], ctx->vtcm_activation, vtcm_weight_bufs[0], ctx->vtcm_scales,
+                                         (int) ceil_div((size_t) n_rows, HMX_FP16_TILE_N_ROWS),
+                                         (int) ceil_div(n_cols_a0, HMX_FP16_TILE_N_COLS),
+                                         ctx->k / HMX_FP16_TILE_N_COLS);
+
+  if (1 < n_chunk_cnt) {
+    const size_t n_cols_b1 = smin((size_t) ctx->n - ctx->n_chunk_n_cols, ctx->n_chunk_n_cols);
+    const size_t chunk_ne_b1 = n_cols_b1 * ctx->k;
+    dma_wait_for_idle();
+    dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight_bufs[1], NULL, (int) chunk_ne_b1, ctx->k,
+                                                      ctx->weight_type, ctx->vtcm_qweight);
+  }
+
+  for (int i = 0; i < n_chunk_cnt; ++i) {
+    const size_t nc = (size_t) i * ctx->n_chunk_n_cols;
+    const size_t nc_p1 = nc + ctx->n_chunk_n_cols;
+    const size_t nc_p2 = nc + 2 * ctx->n_chunk_n_cols;
+    const size_t n_cols = smin((size_t) ctx->n - nc, ctx->n_chunk_n_cols);
+    const size_t n_cols_p1 = smin((size_t) ctx->n - nc_p1, ctx->n_chunk_n_cols);
+    const size_t n_cols_p2 = smin((size_t) ctx->n - nc_p2, ctx->n_chunk_n_cols);
+
+    // issue A_{i+2}
+    if (i + 2 < n_chunk_cnt) {
+      const size_t chunk_ne_p2 = n_cols_p2 * ctx->k;
+      const size_t chunk_size_p2 = chunk_ne_p2 / QK_K * ctx->super_block_size;
+      const uint8_t *qweight_chunk_p2 = ctx->gate_weight + (nc_p2 * ctx->k / QK_K) * ctx->super_block_size;
+      dma_issue_load_from_ddr_local(&dma_desc, ctx->vtcm_qweight, qweight_chunk_p2, chunk_size_p2);
+    }
+
+    // wait for C_i
+    worker_pool_synctoken_wait(&hmx_task_state.sync_ctx);
+
+    // B_{i+1} should already be ready here, so we can immediately issue C_{i+1}.
+    if (i + 1 < n_chunk_cnt) {
+      submit_core_dot_chunk_fp16_async_local(&hmx_task_state, &hmx_task_job,
+                                             vtcm_output_bufs[(i + 1) % 2],
+                                             ctx->vtcm_activation,
+                                             vtcm_weight_bufs[(i + 1) % 2],
+                                             ctx->vtcm_scales,
+                                             (int) ceil_div((size_t) n_rows, HMX_FP16_TILE_N_ROWS),
+                                             (int) ceil_div(n_cols_p1, HMX_FP16_TILE_N_COLS),
+                                             ctx->k / HMX_FP16_TILE_N_COLS);
+    }
+
+    // compute D_i
+    silu_gate_chunk_fp16_to_fp32_local(ctx->dst + nc,
+                                       vtcm_output_bufs[i % 2],
+                                       n_rows,
+                                       (int) n_cols,
+                                       ctx->n,
+                                       ctx->silu_lut,
+                                       ctx->silu_lut_size,
+                                       ctx->silu_lut_clamp,
+                                       ctx->use_silu_lut);
+
+    // wait for A_{i+2}, then compute B_{i+2}
+    if (i + 2 < n_chunk_cnt) {
+      const size_t chunk_ne_p2 = n_cols_p2 * ctx->k;
+      dma_wait_for_idle();
+      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight_bufs[(i + 2) % 2], NULL, (int) chunk_ne_p2, ctx->k,
+                                                        ctx->weight_type, ctx->vtcm_qweight);
+    }
+  }
+
+  return 0;
+}
+
+static int swiglu_gate_up_qk_pipeline_up_pass_local(const swiglu_gate_up_qk_stage_ctx_local_t *ctx) {
+  static dma_desc_1d_t dma_desc __attribute__((aligned(64)));
+  static swiglu_gate_up_core_dot_task_state_local_t hmx_task_state;
+  static worker_pool_job_t hmx_task_job;
+
+  const int n_chunk_cnt = (int) ceil_div((size_t) ctx->n, ctx->n_chunk_n_cols);
+  const int n_rows = ctx->m;
+  __fp16 *vtcm_weight_bufs[2] = { ctx->vtcm_weight, ctx->vtcm_weight_aux };
+  __fp16 *vtcm_output_bufs[2] = { ctx->vtcm_up_out, ctx->vtcm_up_out_aux };
+
+  if (!ctx->vtcm_weight_aux || !ctx->vtcm_up_out_aux || n_chunk_cnt <= 0) {
+    return -1;
+  }
+
+  // Up pass uses the same 4-stage structure as mat_mul.c:
+  //   A: DMA load up qweight chunk
+  //   B: dequantize qweight chunk into fp16 weight tiles
+  //   C: HMX matmul -> fp16 up tiles
+  //   D: dst *= up
+  //
+  // This is intentionally split from the gate pass so that stage D stays thin
+  // and can be overlapped by the same A/B/C cadence as the standalone matmul.
+
+  // prologue: A0
+  const size_t n_cols_a0 = smin((size_t) ctx->n, ctx->n_chunk_n_cols);
+  const size_t chunk_ne_a0 = n_cols_a0 * ctx->k;
+  const size_t chunk_size_a0 = chunk_ne_a0 / QK_K * ctx->super_block_size;
+  dma_issue_load_from_ddr_local(&dma_desc, ctx->vtcm_qweight, ctx->up_weight, chunk_size_a0);
+
+  // prologue: B0, A1, C0, B1
+  dma_wait_for_idle();
+  dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight_bufs[0], NULL, (int) chunk_ne_a0, ctx->k,
+                                                    ctx->weight_type, ctx->vtcm_qweight);
+
+  if (1 < n_chunk_cnt) {
+    const size_t n_cols_a1 = smin((size_t) ctx->n - ctx->n_chunk_n_cols, ctx->n_chunk_n_cols);
+    const size_t chunk_ne_a1 = n_cols_a1 * ctx->k;
+    const size_t chunk_size_a1 = chunk_ne_a1 / QK_K * ctx->super_block_size;
+    const uint8_t *qweight_chunk_a1 = ctx->up_weight + (ctx->n_chunk_n_cols * ctx->k / QK_K) * ctx->super_block_size;
+    dma_issue_load_from_ddr_local(&dma_desc, ctx->vtcm_qweight, qweight_chunk_a1, chunk_size_a1);
+  }
+
+  submit_core_dot_chunk_fp16_async_local(&hmx_task_state, &hmx_task_job,
+                                         vtcm_output_bufs[0], ctx->vtcm_activation, vtcm_weight_bufs[0], ctx->vtcm_scales,
+                                         (int) ceil_div((size_t) n_rows, HMX_FP16_TILE_N_ROWS),
+                                         (int) ceil_div(n_cols_a0, HMX_FP16_TILE_N_COLS),
+                                         ctx->k / HMX_FP16_TILE_N_COLS);
+
+  if (1 < n_chunk_cnt) {
+    const size_t n_cols_b1 = smin((size_t) ctx->n - ctx->n_chunk_n_cols, ctx->n_chunk_n_cols);
+    const size_t chunk_ne_b1 = n_cols_b1 * ctx->k;
+    dma_wait_for_idle();
+    dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight_bufs[1], NULL, (int) chunk_ne_b1, ctx->k,
+                                                      ctx->weight_type, ctx->vtcm_qweight);
+  }
+
+  for (int i = 0; i < n_chunk_cnt; ++i) {
+    const size_t nc = (size_t) i * ctx->n_chunk_n_cols;
+    const size_t nc_p1 = nc + ctx->n_chunk_n_cols;
+    const size_t nc_p2 = nc + 2 * ctx->n_chunk_n_cols;
+    const size_t n_cols = smin((size_t) ctx->n - nc, ctx->n_chunk_n_cols);
+    const size_t n_cols_p1 = smin((size_t) ctx->n - nc_p1, ctx->n_chunk_n_cols);
+    const size_t n_cols_p2 = smin((size_t) ctx->n - nc_p2, ctx->n_chunk_n_cols);
+
+    // issue A_{i+2}
+    if (i + 2 < n_chunk_cnt) {
+      const size_t chunk_ne_p2 = n_cols_p2 * ctx->k;
+      const size_t chunk_size_p2 = chunk_ne_p2 / QK_K * ctx->super_block_size;
+      const uint8_t *qweight_chunk_p2 = ctx->up_weight + (nc_p2 * ctx->k / QK_K) * ctx->super_block_size;
+      dma_issue_load_from_ddr_local(&dma_desc, ctx->vtcm_qweight, qweight_chunk_p2, chunk_size_p2);
+    }
+
+    // wait for C_i
+    worker_pool_synctoken_wait(&hmx_task_state.sync_ctx);
+
+    // B_{i+1} should already be ready here, so we can immediately issue C_{i+1}.
+    if (i + 1 < n_chunk_cnt) {
+      submit_core_dot_chunk_fp16_async_local(&hmx_task_state, &hmx_task_job,
+                                             vtcm_output_bufs[(i + 1) % 2],
+                                             ctx->vtcm_activation,
+                                             vtcm_weight_bufs[(i + 1) % 2],
+                                             ctx->vtcm_scales,
+                                             (int) ceil_div((size_t) n_rows, HMX_FP16_TILE_N_ROWS),
+                                             (int) ceil_div(n_cols_p1, HMX_FP16_TILE_N_COLS),
+                                             ctx->k / HMX_FP16_TILE_N_COLS);
+    }
+
+    // compute D_i
+    mul_dst_fp32_by_up_chunk_local(ctx->dst + nc,
+                                   vtcm_output_bufs[i % 2],
+                                   n_rows,
+                                   (int) n_cols,
+                                   ctx->n);
+
+    // wait for A_{i+2}, then compute B_{i+2}
+    if (i + 2 < n_chunk_cnt) {
+      const size_t chunk_ne_p2 = n_cols_p2 * ctx->k;
+      dma_wait_for_idle();
+      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight_bufs[(i + 2) % 2], NULL, (int) chunk_ne_p2, ctx->k,
+                                                        ctx->weight_type, ctx->vtcm_qweight);
+    }
+  }
+
+  return 0;
+}
+
+static int swiglu_gate_up_qk_stage5_local(const swiglu_gate_up_qk_stage_ctx_local_t *ctx) {
+  swiglu_gate_up_qk_stage_ctx_local_t tuned = *ctx;
+
+  choose_chunk_shape_high_m_pipeline_local(ctx->m,
+                                           ctx->k,
+                                           ctx->n,
+                                           get_weight_area_size_local(),
+                                           get_activation_area_size_local(),
+                                           get_output_area_size_local(),
+                                           get_qweight_area_size_local(),
+                                           ctx->super_block_size,
+                                           &tuned.m_chunk_n_rows,
+                                           &tuned.n_chunk_n_cols);
+
+  // Stage 5 is a "true pipeline" variant for larger m:
+  //   pass 1: gate matmul in a 4-stage pipeline, epilogue = SiLU(store to dst)
+  //   pass 2: up   matmul in a 4-stage pipeline, epilogue = mul(dst, up)
+  //
+  // Compared with the earlier fused stages, this matches mat_mul.c more closely:
+  // each pass has explicit prologue / steady-state loop / epilogue behavior and
+  // keeps D as a thin post-matmul stage.
+  for (size_t mr = 0; mr < (size_t) tuned.m; mr += tuned.m_chunk_n_rows) {
+    const size_t n_rows = smin((size_t) tuned.m - mr, tuned.m_chunk_n_rows);
+    const float *activation_chunk = tuned.activation + mr * tuned.k;
+
+    transfer_activation_chunk_fp32_to_fp16_local(tuned.vtcm_activation, activation_chunk, (int) n_rows, tuned.k, tuned.k);
+
+    swiglu_gate_up_qk_stage_ctx_local_t chunk_ctx = tuned;
+    chunk_ctx.dst = tuned.dst + mr * tuned.n;
+    chunk_ctx.activation = activation_chunk;
+    chunk_ctx.m = (int) n_rows;
+
+    int ret = swiglu_gate_up_qk_pipeline_gate_pass_local(&chunk_ctx);
+    if (ret != 0) {
+      return ret;
+    }
+
+    ret = swiglu_gate_up_qk_pipeline_up_pass_local(&chunk_ctx);
+    if (ret != 0) {
+      return ret;
+    }
+  }
+
+  return 0;
+}
+
+static int swiglu_gate_up_qk_stage6_local(const swiglu_gate_up_qk_stage_ctx_local_t *ctx) {
+  static dma_desc_1d_t dma_desc __attribute__((aligned(64)));
+  static swiglu_gate_up_core_dot_task_state_local_t hmx_task_state;
+  static worker_pool_job_t hmx_task_job;
+
+  swiglu_gate_up_qk_stage_ctx_local_t tuned = *ctx;
+
+  choose_chunk_shape_high_m_pipeline_local(ctx->m,
+                                           ctx->k,
+                                           ctx->n,
+                                           get_weight_area_size_local(),
+                                           get_activation_area_size_local(),
+                                           get_output_area_size_local(),
+                                           get_qweight_area_size_local(),
+                                           ctx->super_block_size,
+                                           &tuned.m_chunk_n_rows,
+                                           &tuned.n_chunk_n_cols);
+
+  if (!tuned.vtcm_weight_aux) {
+    return -1;
+  }
+
+  // Stage 6 is the joint single-function pipeline:
+  //
+  //   gate: A_g -> B_g -> C_g -> D_g
+  //   up  : A_u -> B_u -> C_u -> D_u
+  //
+  // We keep one HMX stream and one DMA stream, then phase-shift the two 4-stage
+  // sub-pipelines so that:
+  //   - C_g(i) overlaps with A_u(i) / B_u(i) and D_u(i-1)
+  //   - C_u(i) overlaps with A_g(i+1) / B_g(i+1) and D_g(i)
+  //
+  // Buffering scheme:
+  //   A --> B: vtcm_qweight, 1 buffer
+  //   B --> C: gate_weight / up_weight, 2 dedicated buffers
+  //   C --> D: gate_out / up_out, 2 dedicated buffers
+  //
+  // Compared with stage5, this avoids pass-level serialization between gate and up.
+
+  for (size_t mr = 0; mr < (size_t) tuned.m; mr += tuned.m_chunk_n_rows) {
+    const size_t n_rows = smin((size_t) tuned.m - mr, tuned.m_chunk_n_rows);
+    const float *activation_chunk = tuned.activation + mr * tuned.k;
+
+    transfer_activation_chunk_fp32_to_fp16_local(tuned.vtcm_activation, activation_chunk, (int) n_rows, tuned.k, tuned.k);
+
+    swiglu_gate_up_qk_stage_ctx_local_t chunk_ctx = tuned;
+    chunk_ctx.dst = tuned.dst + mr * tuned.n;
+    chunk_ctx.activation = activation_chunk;
+    chunk_ctx.m = (int) n_rows;
+
+    const int n_chunk_cnt = (int) ceil_div((size_t) chunk_ctx.n, chunk_ctx.n_chunk_n_cols);
+    if (n_chunk_cnt <= 0) {
+      continue;
+    }
+
+    __fp16 *gate_weight_buf = chunk_ctx.vtcm_weight;
+    __fp16 *up_weight_buf   = chunk_ctx.vtcm_weight_aux;
+    __fp16 *gate_out_buf    = chunk_ctx.vtcm_gate_out;
+    __fp16 *up_out_buf      = chunk_ctx.vtcm_up_out;
+
+    // prologue: A_g0, B_g0
+    {
+      const size_t nc0 = 0;
+      const size_t n_cols0 = smin((size_t) chunk_ctx.n - nc0, chunk_ctx.n_chunk_n_cols);
+      const size_t chunk_ne0 = n_cols0 * chunk_ctx.k;
+      const size_t chunk_size0 = chunk_ne0 / QK_K * chunk_ctx.super_block_size;
+      dma_issue_load_from_ddr_local(&dma_desc, chunk_ctx.vtcm_qweight, chunk_ctx.gate_weight, chunk_size0);
+      dma_wait_for_idle();
+      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(gate_weight_buf, NULL, (int) chunk_ne0, chunk_ctx.k,
+                                                        chunk_ctx.weight_type, chunk_ctx.vtcm_qweight);
+    }
+
+    for (int i = 0; i < n_chunk_cnt; ++i) {
+      const size_t nc = (size_t) i * chunk_ctx.n_chunk_n_cols;
+      const size_t n_cols = smin((size_t) chunk_ctx.n - nc, chunk_ctx.n_chunk_n_cols);
+      const size_t chunk_ne = n_cols * chunk_ctx.k;
+      const size_t up_offset = (nc * chunk_ctx.k / QK_K) * chunk_ctx.super_block_size;
+      const size_t up_chunk_size = chunk_ne / QK_K * chunk_ctx.super_block_size;
+      const int n_row_tiles = (int) ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+      const int n_col_tiles = (int) ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+      const int n_dot_tiles = chunk_ctx.k / HMX_FP16_TILE_N_COLS;
+
+      // C_g(i)
+      submit_core_dot_chunk_fp16_async_local(&hmx_task_state, &hmx_task_job,
+                                             gate_out_buf, chunk_ctx.vtcm_activation, gate_weight_buf, chunk_ctx.vtcm_scales,
+                                             n_row_tiles, n_col_tiles, n_dot_tiles);
+
+      // During C_g(i): A_u(i), D_u(i-1), B_u(i)
+      dma_issue_load_from_ddr_local(&dma_desc, chunk_ctx.vtcm_qweight, chunk_ctx.up_weight + up_offset, up_chunk_size);
+
+      if (i > 0) {
+        const size_t prev_nc = (size_t) (i - 1) * chunk_ctx.n_chunk_n_cols;
+        const size_t prev_n_cols = smin((size_t) chunk_ctx.n - prev_nc, chunk_ctx.n_chunk_n_cols);
+        mul_dst_fp32_by_up_chunk_local(chunk_ctx.dst + prev_nc,
+                                       up_out_buf,
+                                       (int) n_rows,
+                                       (int) prev_n_cols,
+                                       chunk_ctx.n);
+      }
+
+      dma_wait_for_idle();
+      dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(up_weight_buf, NULL, (int) chunk_ne, chunk_ctx.k,
+                                                        chunk_ctx.weight_type, chunk_ctx.vtcm_qweight);
+
+      // wait for C_g(i)
+      worker_pool_synctoken_wait(&hmx_task_state.sync_ctx);
+
+      // C_u(i)
+      submit_core_dot_chunk_fp16_async_local(&hmx_task_state, &hmx_task_job,
+                                             up_out_buf, chunk_ctx.vtcm_activation, up_weight_buf, chunk_ctx.vtcm_scales,
+                                             n_row_tiles, n_col_tiles, n_dot_tiles);
+
+      // During C_u(i): A_g(i+1), D_g(i), B_g(i+1)
+      if (i + 1 < n_chunk_cnt) {
+        const size_t next_nc = (size_t) (i + 1) * chunk_ctx.n_chunk_n_cols;
+        const size_t next_n_cols = smin((size_t) chunk_ctx.n - next_nc, chunk_ctx.n_chunk_n_cols);
+        const size_t next_chunk_ne = next_n_cols * chunk_ctx.k;
+        const size_t next_gate_offset = (next_nc * chunk_ctx.k / QK_K) * chunk_ctx.super_block_size;
+        const size_t next_gate_chunk_size = next_chunk_ne / QK_K * chunk_ctx.super_block_size;
+
+        dma_issue_load_from_ddr_local(&dma_desc, chunk_ctx.vtcm_qweight,
+                                      chunk_ctx.gate_weight + next_gate_offset, next_gate_chunk_size);
+
+        silu_gate_chunk_fp16_to_fp32_local(chunk_ctx.dst + nc,
+                                           gate_out_buf,
+                                           (int) n_rows,
+                                           (int) n_cols,
+                                           chunk_ctx.n,
+                                           chunk_ctx.silu_lut,
+                                           chunk_ctx.silu_lut_size,
+                                           chunk_ctx.silu_lut_clamp,
+                                           chunk_ctx.use_silu_lut);
+
+        dma_wait_for_idle();
+        dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(gate_weight_buf, NULL, (int) next_chunk_ne, chunk_ctx.k,
+                                                          chunk_ctx.weight_type, chunk_ctx.vtcm_qweight);
+      } else {
+        silu_gate_chunk_fp16_to_fp32_local(chunk_ctx.dst + nc,
+                                           gate_out_buf,
+                                           (int) n_rows,
+                                           (int) n_cols,
+                                           chunk_ctx.n,
+                                           chunk_ctx.silu_lut,
+                                           chunk_ctx.silu_lut_size,
+                                           chunk_ctx.silu_lut_clamp,
+                                           chunk_ctx.use_silu_lut);
+      }
+
+      // wait for C_u(i)
+      worker_pool_synctoken_wait(&hmx_task_state.sync_ctx);
+    }
+
+    // epilogue: D_u(last)
+    {
+      const size_t last_nc = (size_t) (n_chunk_cnt - 1) * chunk_ctx.n_chunk_n_cols;
+      const size_t last_n_cols = smin((size_t) chunk_ctx.n - last_nc, chunk_ctx.n_chunk_n_cols);
+      mul_dst_fp32_by_up_chunk_local(chunk_ctx.dst + last_nc,
+                                     up_out_buf,
+                                     (int) n_rows,
+                                     (int) last_n_cols,
+                                     chunk_ctx.n);
+    }
+  }
+
+  return 0;
+}
+
 void dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, const void *src, int ne, int k,
                                                        enum ggml_type type, void *vtcm_scratch);
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activation,
@@ -787,38 +1424,37 @@ int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst,
     return -1;
   }
 
+  const size_t weight_area_size = get_weight_area_size_local();
+  const size_t activation_area_size = get_activation_area_size_local();
+  const size_t output_area_size = get_output_area_size_local();
+  const size_t qweight_area_size = get_qweight_area_size_local();
+
   uint8_t *vtcm_ptr        = (uint8_t *) vtcm_manager_get_vtcm_base();
-  __fp16  *vtcm_weight     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_WEIGHT_AREA_SIZE);
-#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 2
-  __fp16  *vtcm_weight_aux = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_WEIGHT_AREA_SIZE);
-#else
-  __fp16  *vtcm_weight_aux = NULL;
-#endif
-  __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_ACTIVATION_AREA_SIZE);
-  __fp16  *vtcm_gate_out   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_OUTPUT_AREA_SIZE);
-#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 3
-  __fp16  *vtcm_gate_out_aux = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_OUTPUT_AREA_SIZE);
-#else
-  __fp16  *vtcm_gate_out_aux = NULL;
-#endif
-  __fp16  *vtcm_up_out     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_OUTPUT_AREA_SIZE);
-#if SWIGLU_GATE_UP_ACTIVE_STAGE >= 3
-  __fp16  *vtcm_up_out_aux = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, FUSED_OUTPUT_AREA_SIZE);
-#else
-  __fp16  *vtcm_up_out_aux = NULL;
-#endif
-  void    *vtcm_qweight    = vtcm_seq_alloc(&vtcm_ptr, FUSED_QWEIGHT_AREA_SIZE);
+  __fp16  *vtcm_weight     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, weight_area_size);
+  __fp16  *vtcm_weight_aux = stage_uses_weight_aux_local() ? (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, weight_area_size) : NULL;
+  __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, activation_area_size);
+  __fp16  *vtcm_gate_out   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
+  __fp16  *vtcm_gate_out_aux = stage_uses_output_aux_local() ? (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size) : NULL;
+  __fp16  *vtcm_up_out     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
+  __fp16  *vtcm_up_out_aux = stage_uses_output_aux_local() ? (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size) : NULL;
+  void    *vtcm_qweight    = vtcm_seq_alloc(&vtcm_ptr, qweight_area_size);
   __fp16  *vtcm_scales     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
 
   hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));
 
   const size_t vec_dot_size       = k * sizeof(__fp16);
-  const size_t m_chunk_max_n_rows = align_down(FUSED_ACTIVATION_AREA_SIZE / vec_dot_size, HMX_FP16_TILE_N_ROWS);
-  const size_t n_chunk_max_n_cols = align_down(FUSED_WEIGHT_AREA_SIZE / vec_dot_size, HMX_FP16_TILE_N_COLS);
+  const size_t m_chunk_max_n_rows = align_down(activation_area_size / vec_dot_size, HMX_FP16_TILE_N_ROWS);
+  const size_t n_chunk_max_n_cols_by_weight = align_down(weight_area_size / vec_dot_size, HMX_FP16_TILE_N_COLS);
+  const size_t qweight_bytes_per_col = ((size_t) k / QK_K) * super_block_size;
+  const size_t n_chunk_max_n_cols_by_qweight = qweight_bytes_per_col == 0
+                                                   ? 0
+                                                   : align_down(qweight_area_size / qweight_bytes_per_col,
+                                                                HMX_FP16_TILE_N_COLS);
+  const size_t n_chunk_max_n_cols = smin(n_chunk_max_n_cols_by_weight, n_chunk_max_n_cols_by_qweight);
 
   size_t m_chunk_n_rows = 0;
   size_t n_chunk_n_cols = 0;
-  find_chunk_size_local(m_chunk_max_n_rows, n_chunk_max_n_cols, FUSED_OUTPUT_AREA_SIZE / sizeof(__fp16),
+  find_chunk_size_local(m_chunk_max_n_rows, n_chunk_max_n_cols, output_area_size / sizeof(__fp16),
                         HMX_FP16_TILE_N_ROWS, HMX_FP16_TILE_N_COLS, &m_chunk_n_rows, &n_chunk_n_cols);
 
   if (m_chunk_n_rows == 0 || n_chunk_n_cols == 0) {
@@ -860,6 +1496,12 @@ int hmx_hvx_swiglu_gate_up_fused_qk_0_d16a32(float *restrict dst,
       return swiglu_gate_up_qk_stage2_local(&ctx);
     case 3:
       return swiglu_gate_up_qk_stage3_local(&ctx);
+    case 4:
+      return swiglu_gate_up_qk_stage4_local(&ctx);
+    case 5:
+      return swiglu_gate_up_qk_stage5_local(&ctx);
+    case 6:
+      return swiglu_gate_up_qk_stage6_local(&ctx);
     default:
       return -1;
   }
