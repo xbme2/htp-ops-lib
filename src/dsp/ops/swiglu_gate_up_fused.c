@@ -299,6 +299,68 @@ static inline float silu_lut_scalar_local(float x, const float *lut, int lut_siz
   return y0 + (y1 - y0) * t;
 }
 
+static inline const uint8_t *query_safe_softmax_exp2_table_local(void) {
+  return (const uint8_t *) vtcm_manager_query_area("safe_softmax::exp2_hf_qf16");
+}
+
+static inline HVX_Vector lookup_exp2_from_neg_sf_pair_local(HVX_Vector v_x0_neg_sf,
+                                                            HVX_Vector v_x1_neg_sf,
+                                                            const uint8_t *exp2_table) {
+  _Alignas(VLEN) HVX_Vector v_exp_hf;
+  const HVX_Vector v_gather_input = Q6_Vh_vasl_VhR(hvx_my_wsf_to_vhf(v_x1_neg_sf, v_x0_neg_sf), 1);
+  Q6_vgather_ARMVh(&v_exp_hf, (size_t) exp2_table, 65535, v_gather_input);
+  return v_exp_hf;
+}
+
+static inline HVX_Vector silu_vhf_from_table_local(HVX_Vector v_gate_hf, const uint8_t *exp2_table) {
+  const HVX_Vector v_zero_sf     = Q6_V_vzero();
+  const HVX_Vector v_one_sf      = Q6_V_vsplat_R(0x3F800000);
+  const HVX_Vector v_neg_log2e   = Q6_V_vsplat_R(0xBFB8AA3C);  // -log2(e)
+  const HVX_VectorPair vp_gate   = hvx_my_vhf_to_wsf(v_gate_hf);
+  const HVX_Vector v_gate0_sf    = Q6_V_lo_W(vp_gate);
+  const HVX_Vector v_gate1_sf    = Q6_V_hi_W(vp_gate);
+  const HVX_VectorPred q_gate0_n = Q6_Q_vcmp_gt_VsfVsf(v_zero_sf, v_gate0_sf);
+  const HVX_VectorPred q_gate1_n = Q6_Q_vcmp_gt_VsfVsf(v_zero_sf, v_gate1_sf);
+
+  const HVX_Vector v_neg_gate0_sf = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(v_zero_sf, v_gate0_sf));
+  const HVX_Vector v_neg_gate1_sf = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(v_zero_sf, v_gate1_sf));
+  const HVX_Vector v_abs_gate0_sf = Q6_V_vmux_QVV(q_gate0_n, v_neg_gate0_sf, v_gate0_sf);
+  const HVX_Vector v_abs_gate1_sf = Q6_V_vmux_QVV(q_gate1_n, v_neg_gate1_sf, v_gate1_sf);
+
+  const HVX_Vector v_scaled0_sf =
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v_abs_gate0_sf, v_neg_log2e));
+  const HVX_Vector v_scaled1_sf =
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v_abs_gate1_sf, v_neg_log2e));
+
+  const HVX_Vector v_exp_hf = lookup_exp2_from_neg_sf_pair_local(v_scaled0_sf, v_scaled1_sf, exp2_table);
+  const HVX_VectorPair vp_exp = hvx_my_vhf_to_wsf(v_exp_hf);
+  const HVX_Vector v_exp0_sf = Q6_V_lo_W(vp_exp);
+  const HVX_Vector v_exp1_sf = Q6_V_hi_W(vp_exp);
+
+  const HVX_Vector v_denom0_sf = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v_exp0_sf, v_one_sf));
+  const HVX_Vector v_denom1_sf = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v_exp1_sf, v_one_sf));
+  const HVX_Vector v_inv0_qf32 = hvx_my_inv_vqf32_vsf(v_denom0_sf);
+  const HVX_Vector v_inv1_qf32 = hvx_my_inv_vqf32_vsf(v_denom1_sf);
+
+  const HVX_Vector v_gate0_qf32 = Q6_Vqf32_vadd_VsfVsf(v_gate0_sf, v_zero_sf);
+  const HVX_Vector v_gate1_qf32 = Q6_Vqf32_vadd_VsfVsf(v_gate1_sf, v_zero_sf);
+  const HVX_Vector v_gate_exp0_qf32 = Q6_Vqf32_vmpy_VsfVsf(v_gate0_sf, v_exp0_sf);
+  const HVX_Vector v_gate_exp1_qf32 = Q6_Vqf32_vmpy_VsfVsf(v_gate1_sf, v_exp1_sf);
+
+  const HVX_Vector v_silu_pos0_sf =
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_Vqf32Vqf32(v_gate0_qf32, v_inv0_qf32));
+  const HVX_Vector v_silu_pos1_sf =
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_Vqf32Vqf32(v_gate1_qf32, v_inv1_qf32));
+  const HVX_Vector v_silu_neg0_sf =
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_Vqf32Vqf32(v_gate_exp0_qf32, v_inv0_qf32));
+  const HVX_Vector v_silu_neg1_sf =
+      Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_Vqf32Vqf32(v_gate_exp1_qf32, v_inv1_qf32));
+
+  const HVX_Vector v_silu0_sf = Q6_V_vmux_QVV(q_gate0_n, v_silu_neg0_sf, v_silu_pos0_sf);
+  const HVX_Vector v_silu1_sf = Q6_V_vmux_QVV(q_gate1_n, v_silu_neg1_sf, v_silu_pos1_sf);
+  return hvx_my_wsf_to_vhf(v_silu1_sf, v_silu0_sf);
+}
+
 static void fuse_gate_up_fp32_local(float *restrict dst,
                                     const float *restrict gate,
                                     const float *restrict up,
@@ -449,6 +511,61 @@ static void silu_gate_chunk_fp16_to_fp32_local(float *restrict dst,
   }
 }
 
+static void silu_gate_chunk_fp16_inplace_local(__fp16 *restrict gate_vtcm,
+                                               int n_rows,
+                                               int n_cols,
+                                               const float *restrict silu_lut,
+                                               int silu_lut_size,
+                                               float silu_lut_clamp,
+                                               bool use_silu_lut) {
+  assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
+
+  const int n_col_tiles = n_cols / HMX_FP16_TILE_N_COLS;
+  const uint8_t *exp2_table = use_silu_lut ? NULL : query_safe_softmax_exp2_table_local();
+
+  _Alignas(VLEN) float gate_row0[32];
+  _Alignas(VLEN) float gate_row1[32];
+  _Alignas(VLEN) float out_row0[32];
+  _Alignas(VLEN) float out_row1[32];
+
+  for (int r = 0; r < n_rows; r += 2) {
+    const int r0 = r / HMX_FP16_TILE_N_ROWS;
+    const int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+    for (int c = 0; c < n_cols; c += HMX_FP16_TILE_N_COLS) {
+      const int c0 = c / HMX_FP16_TILE_N_COLS;
+      __fp16 *gate_tile = gate_vtcm + (r0 * n_col_tiles + c0) * HMX_FP16_TILE_N_ELMS;
+      HVX_Vector *pv_gate_tile = (HVX_Vector *) gate_tile;
+      const HVX_Vector v_gate_hf = pv_gate_tile[r1 / 2];
+
+      HVX_Vector v_silu_hf;
+      if (!use_silu_lut) {
+        if (exp2_table) {
+          v_silu_hf = silu_vhf_from_table_local(v_gate_hf, exp2_table);
+        } else {
+          const HVX_VectorPair vp_gate = hvx_my_vhf_to_wsf(v_gate_hf);
+          const HVX_Vector v_silu0_sf = hvx_silu_vec_f32_local(Q6_V_lo_W(vp_gate));
+          const HVX_Vector v_silu1_sf = hvx_silu_vec_f32_local(Q6_V_hi_W(vp_gate));
+          v_silu_hf = hvx_my_wsf_to_vhf(v_silu1_sf, v_silu0_sf);
+        }
+      } else {
+        const HVX_VectorPair vp_gate = hvx_my_vhf_to_wsf(v_gate_hf);
+        vmem(gate_row0) = Q6_V_lo_W(vp_gate);
+        vmem(gate_row1) = Q6_V_hi_W(vp_gate);
+
+        for (int i = 0; i < 32; ++i) {
+          out_row0[i] = silu_lut_scalar_local(gate_row0[i], silu_lut, silu_lut_size, silu_lut_clamp);
+          out_row1[i] = silu_lut_scalar_local(gate_row1[i], silu_lut, silu_lut_size, silu_lut_clamp);
+        }
+
+        v_silu_hf = hvx_my_wsf_to_vhf(vmem(out_row1), vmem(out_row0));
+      }
+
+      pv_gate_tile[r1 / 2] = v_silu_hf;
+    }
+  }
+}
+
 static void mul_dst_fp32_by_up_chunk_local(float *restrict dst,
                                            const __fp16 *restrict up_vtcm,
                                            int n_rows,
@@ -481,6 +598,61 @@ static void mul_dst_fp32_by_up_chunk_local(float *restrict dst,
       }
     }
   }
+}
+
+static void mul_gate_up_chunk_fp16_to_fp32_local(float *restrict dst,
+                                                 const __fp16 *restrict gate_vtcm,
+                                                 const __fp16 *restrict up_vtcm,
+                                                 int n_rows,
+                                                 int n_cols,
+                                                 int dst_stride) {
+  assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
+
+  const int n_col_tiles = n_cols / HMX_FP16_TILE_N_COLS;
+
+  for (int r = 0; r < n_rows; r += 2) {
+    const int r0 = r / HMX_FP16_TILE_N_ROWS;
+    const int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+    for (int c = 0; c < n_cols; c += HMX_FP16_TILE_N_COLS) {
+      const int c0 = c / HMX_FP16_TILE_N_COLS;
+      const __fp16 *gate_tile = gate_vtcm + (r0 * n_col_tiles + c0) * HMX_FP16_TILE_N_ELMS;
+      const __fp16 *up_tile = up_vtcm + (r0 * n_col_tiles + c0) * HMX_FP16_TILE_N_ELMS;
+
+      const HVX_Vector v_gate_hf = ((const HVX_Vector *) gate_tile)[r1 / 2];
+      const HVX_Vector v_up_hf = ((const HVX_Vector *) up_tile)[r1 / 2];
+      const HVX_VectorPair vp_gate = hvx_my_vhf_to_wsf(v_gate_hf);
+      const HVX_VectorPair vp_up = hvx_my_vhf_to_wsf(v_up_hf);
+
+      HVX_Vector *pv_dst0 = (HVX_Vector *) (dst + r * dst_stride + c);
+      *pv_dst0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_V_lo_W(vp_gate), Q6_V_lo_W(vp_up)));
+
+      if (r + 1 < n_rows) {
+        HVX_Vector *pv_dst1 = (HVX_Vector *) (dst + (r + 1) * dst_stride + c);
+        *pv_dst1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_V_hi_W(vp_gate), Q6_V_hi_W(vp_up)));
+      }
+    }
+  }
+}
+
+static void split_silu_mul_gate_up_chunk_fp16_to_fp32_local(float *restrict dst,
+                                                             __fp16 *restrict gate_vtcm,
+                                                             const __fp16 *restrict up_vtcm,
+                                                             int n_rows,
+                                                             int n_cols,
+                                                             int dst_stride,
+                                                             const float *restrict silu_lut,
+                                                             int silu_lut_size,
+                                                             float silu_lut_clamp,
+                                                             bool use_silu_lut) {
+  silu_gate_chunk_fp16_inplace_local(gate_vtcm,
+                                     n_rows,
+                                     n_cols,
+                                     silu_lut,
+                                     silu_lut_size,
+                                     silu_lut_clamp,
+                                     use_silu_lut);
+  mul_gate_up_chunk_fp16_to_fp32_local(dst, gate_vtcm, up_vtcm, n_rows, n_cols, dst_stride);
 }
 
 typedef struct {
@@ -588,16 +760,16 @@ static int swiglu_gate_up_qk_stage0_local(const swiglu_gate_up_qk_stage_ctx_loca
                                 (int) ceil_div(n_cols, HMX_FP16_TILE_N_COLS),
                                 ctx->k / HMX_FP16_TILE_N_COLS);
 
-      fuse_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + nc,
-                                            ctx->vtcm_gate_out,
-                                            ctx->vtcm_up_out,
-                                            (int) n_rows,
-                                            (int) n_cols,
-                                            ctx->n,
-                                            ctx->silu_lut,
-                                            ctx->silu_lut_size,
-                                            ctx->silu_lut_clamp,
-                                            ctx->use_silu_lut);
+      split_silu_mul_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + nc,
+                                                      ctx->vtcm_gate_out,
+                                                      ctx->vtcm_up_out,
+                                                      (int) n_rows,
+                                                      (int) n_cols,
+                                                      ctx->n,
+                                                      ctx->silu_lut,
+                                                      ctx->silu_lut_size,
+                                                      ctx->silu_lut_clamp,
+                                                      ctx->use_silu_lut);
     }
   }
 
@@ -662,16 +834,16 @@ static int swiglu_gate_up_qk_stage1_local(const swiglu_gate_up_qk_stage_ctx_loca
       core_dot_chunk_fp16_local(ctx->vtcm_up_out, ctx->vtcm_activation, ctx->vtcm_weight, ctx->vtcm_scales,
                                 n_row_tiles, n_col_tiles, ctx->k / HMX_FP16_TILE_N_COLS);
 
-      fuse_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + nc,
-                                            ctx->vtcm_gate_out,
-                                            ctx->vtcm_up_out,
-                                            (int) n_rows,
-                                            (int) n_cols,
-                                            ctx->n,
-                                            ctx->silu_lut,
-                                            ctx->silu_lut_size,
-                                            ctx->silu_lut_clamp,
-                                            ctx->use_silu_lut);
+      split_silu_mul_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + nc,
+                                                      ctx->vtcm_gate_out,
+                                                      ctx->vtcm_up_out,
+                                                      (int) n_rows,
+                                                      (int) n_cols,
+                                                      ctx->n,
+                                                      ctx->silu_lut,
+                                                      ctx->silu_lut_size,
+                                                      ctx->silu_lut_clamp,
+                                                      ctx->use_silu_lut);
     }
   }
 
@@ -746,16 +918,16 @@ static int swiglu_gate_up_qk_stage2_local(const swiglu_gate_up_qk_stage_ctx_loca
 
       worker_pool_synctoken_wait(&hmx_task_state.sync_ctx);
 
-      fuse_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + nc,
-                                            ctx->vtcm_gate_out,
-                                            ctx->vtcm_up_out,
-                                            (int) n_rows,
-                                            (int) n_cols,
-                                            ctx->n,
-                                            ctx->silu_lut,
-                                            ctx->silu_lut_size,
-                                            ctx->silu_lut_clamp,
-                                            ctx->use_silu_lut);
+      split_silu_mul_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + nc,
+                                                      ctx->vtcm_gate_out,
+                                                      ctx->vtcm_up_out,
+                                                      (int) n_rows,
+                                                      (int) n_cols,
+                                                      ctx->n,
+                                                      ctx->silu_lut,
+                                                      ctx->silu_lut_size,
+                                                      ctx->silu_lut_clamp,
+                                                      ctx->use_silu_lut);
     }
   }
 
@@ -838,16 +1010,16 @@ static int swiglu_gate_up_qk_stage3_local(const swiglu_gate_up_qk_stage_ctx_loca
                                              n_row_tiles, n_col_tiles, n_dot_tiles);
 
       if (prev_chunk_ready) {
-        fuse_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + prev_nc,
-                                              gate_out_bufs[prev_slot],
-                                              up_out_bufs[prev_slot],
-                                              (int) n_rows,
-                                              (int) prev_n_cols,
-                                              ctx->n,
-                                              ctx->silu_lut,
-                                              ctx->silu_lut_size,
-                                              ctx->silu_lut_clamp,
-                                              ctx->use_silu_lut);
+        split_silu_mul_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + prev_nc,
+                                                        gate_out_bufs[prev_slot],
+                                                        up_out_bufs[prev_slot],
+                                                        (int) n_rows,
+                                                        (int) prev_n_cols,
+                                                        ctx->n,
+                                                        ctx->silu_lut,
+                                                        ctx->silu_lut_size,
+                                                        ctx->silu_lut_clamp,
+                                                        ctx->use_silu_lut);
       }
 
       worker_pool_synctoken_wait(&hmx_task_state.sync_ctx);
@@ -859,16 +1031,16 @@ static int swiglu_gate_up_qk_stage3_local(const swiglu_gate_up_qk_stage_ctx_loca
     }
 
     if (prev_chunk_ready) {
-      fuse_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + prev_nc,
-                                            gate_out_bufs[prev_slot],
-                                            up_out_bufs[prev_slot],
-                                            (int) n_rows,
-                                            (int) prev_n_cols,
-                                            ctx->n,
-                                            ctx->silu_lut,
-                                            ctx->silu_lut_size,
-                                            ctx->silu_lut_clamp,
-                                            ctx->use_silu_lut);
+      split_silu_mul_gate_up_chunk_fp16_to_fp32_local(ctx->dst + mr * ctx->n + prev_nc,
+                                                      gate_out_bufs[prev_slot],
+                                                      up_out_bufs[prev_slot],
+                                                      (int) n_rows,
+                                                      (int) prev_n_cols,
+                                                      ctx->n,
+                                                      ctx->silu_lut,
+                                                      ctx->silu_lut_size,
+                                                      ctx->silu_lut_clamp,
+                                                      ctx->use_silu_lut);
     }
   }
 
